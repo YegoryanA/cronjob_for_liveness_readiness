@@ -1,0 +1,153 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: probe-checker-role
+rules:
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["get", "list"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+
+---
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: probe-checker-binding
+subjects:
+- kind: ServiceAccount
+  name: probe-checker
+  namespace: haltest
+roleRef:
+  kind: ClusterRole
+  name: probe-checker-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: probe-checker
+  namespace: haltest 
+
+---
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: probe-checker
+  namespace: haltest
+spec:
+  concurrencyPolicy: Forbid
+  schedule: "*/3 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: probe-checker
+        spec:
+          serviceAccountName: probe-checker
+          containers:
+          - name: probe-checker
+            image: yegoryana/kubectl-curl:latest 
+            command: 
+            - /bin/sh
+            - -c
+            - cat /configmap/probe.sh | bin/sh
+            volumeMounts:
+            - mountPath: /configmap
+              name: probe-checker
+          ports:
+          - containerPort: 8000
+            name: http
+            protocol: TCP
+          restartPolicy: Never
+          volumes:
+          - configMap:
+              defaultMode: 420
+              items:
+              - key: probe.sh
+                path: probe.sh
+              name: probe-checker
+            name: probe-checker
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    prometheus.io/port: "8000"
+    prometheus.io/scrape: "true"
+  name: probe-checker
+  namespace: haltest
+spec:
+  selector:
+    app: probe-checker  
+  ports:
+    - name: http
+      port: 80
+      protocol: TCP
+      targetPort: 8000
+  type: ClusterIP
+
+---
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: probe-checker
+  namespace: haltest
+data:
+  probe.sh: |
+    #!/bin/bash
+    
+    # get all namespaces except specified ones
+    namespaces=$(kubectl get ns --no-headers | grep -Ev 'default|elastic|elastic-system|ingress-nginx|istio-system|kube-public|kube-system|kubeless|monitoring|perftesting|spinnaker|testops|velero|vault|consul|ingress-sync|portal-qa|kube-node-lease' | awk '{print $1}')
+    
+    # get deployments names in all namespaces
+    for namespace in $namespaces; do
+        deployments=$(kubectl get deploy --no-headers -n "$namespace" 2>&1 | grep -v "No resources found" | awk '{print$1}' | grep -Ev 'relservice|redis-exporter|es-master|es-master1')
+
+        # check all deployments
+        for deployment in $deployments; do
+
+            # get readiness and liveness probes
+            probes_readiness=$(kubectl get deploy "$deployment" -n "$namespace" -o=jsonpath='{.spec.template.spec.containers[0].readinessProbe}')
+            probes_liveness=$(kubectl get deploy "$deployment" -n "$namespace" -o=jsonpath='{.spec.template.spec.containers[0].livenessProbe}')
+
+            # print deployment name without both probes and do healthcheck
+            if [ -z "$probes_readiness" ] || [ "$probes_readiness" = "null" ] || [ -z "$probes_liveness" ] || [ "$probes_liveness" = "null" ]; then
+                echo "ReadinessProbe{namespace="$namespace",service="$deployment"} 1";
+                echo "LivenessProbe{namespace="$namespace",service="$deployment"} 1";
+                healthcheck=$(curl -s -w "%{http_code}"  http://$deployment.$namespace.svc:80/health -o /dev/null);
+                if [ "$healthcheck" != "200" ]; then
+                   echo "Healthcheck{namespace="$namespace",service="$deployment"} 1"
+                fi
+            # print deployment name without readiness probe and do healthcheck
+            elif [ -z "$probes_readiness" ] || [ "$probes_readiness" = "null" ] ; then
+                echo "ReadinessProbe{namespace="$namespace",service="$deployment"} 1";
+                healthcheck=$(curl -s -w "%{http_code}"  http://$deployment.$namespace.svc:80/health -o /dev/null);
+                if [ "$healthcheck" != "200" ]; then
+                   echo "Healthcheck{namespace="$namespace",service="$deployment"} 1"
+                fi
+            # print deployment name without liveness probe and do healthcheck 
+            elif [ -z "$probes_liveness" ] || [ "$probes_liveness" = "null" ]; then
+                echo "LivenessProbe{namespace="$namespace",service="$deployment"} 1";
+                healthcheck=$(curl -s -w "%{http_code}"  http://$deployment.$namespace.svc:80/health -o /dev/null);
+                if [ "$healthcheck" != "200" ]; then
+                   echo "Healthcheck{namespace="$namespace",service="$deployment"} 1"
+                fi
+            # print deployment name with both probes 
+            else
+                echo "ReadinessProbe{namespace="$namespace",service="$deployment"} 0";
+                echo "LivenessProbe{namespace="$namespace",service="$deployment"} 0";
+            fi
+        done
+    done
